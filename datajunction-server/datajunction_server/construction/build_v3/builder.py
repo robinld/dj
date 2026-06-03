@@ -52,6 +52,7 @@ from datajunction_server.construction.build_v3.utils import (
 )
 from datajunction_server.database.partition import Partition
 from datajunction_server.errors import DJError, DJInvalidInputException, ErrorCode
+from datajunction_server.instrumentation import events
 from datajunction_server.models.dialect import Dialect
 from datajunction_server.models.partition import PartitionType
 from datajunction_server.sql.parsing import ast
@@ -532,6 +533,14 @@ async def build_metrics_sql(
                 dialect = Dialect.TRINO
         else:
             dialect = Dialect.TRINO
+
+    # Emit after dialect resolution (so engine is accurate) but before the heavy build.
+    events.emit(
+        "query_requested",
+        metrics=list(metrics),
+        dimensions=list(dimensions),
+        engine=dialect.name,
+    )
 
     # Setup context (loads nodes, decomposes metrics, adds dimensions from expressions)
     ctx = await setup_build_context(
