@@ -19,6 +19,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from datajunction_server.api.helpers import get_node_namespace, get_save_history
+from datajunction_server.database.history import History
 from datajunction_server.database.namespace import NodeNamespace
 from datajunction_server.database.node import Node, NodeRevision
 from datajunction_server.database.user import User
@@ -34,6 +35,7 @@ from datajunction_server.internal.access.authorization import (
 )
 from datajunction_server.internal.git.github_service import GitHubService
 from datajunction_server.internal.git.github_service import GitHubServiceError
+from datajunction_server.internal.history import ActivityType, EntityType
 from datajunction_server.internal.namespaces import (
     hard_delete_namespace,
     resolve_git_config,
@@ -101,6 +103,8 @@ async def _create_namespace_and_copy_nodes(
     branch_name: str,
     root_namespace: NodeNamespace,
     current_user: User,
+    save_history: Callable,
+    github_repo_path: Optional[str] = None,
 ) -> List[DeploymentResult]:
     """Create DJ namespace and copy nodes from appropriate source.
 
@@ -187,7 +191,26 @@ async def _create_namespace_and_copy_nodes(
         parent_namespace=parent_namespace,
     )
     session.add(new_ns)
-    await session.commit()
+
+    # Record the branch creation in history. The nodenamespace table itself
+    # carries no created_at/updated_at, so this event is the only temporal
+    # record that the branch was created (and of its git metadata at creation
+    # time). save_history commits, persisting the namespace and event together.
+    await save_history(
+        event=History(
+            entity_type=EntityType.NAMESPACE,
+            entity_name=new_namespace,
+            node=None,
+            activity_type=ActivityType.CREATE,
+            details={
+                "git_branch": branch_name,
+                "parent_namespace": parent_namespace,
+                "github_repo_path": github_repo_path,
+            },
+            user=current_user.username,
+        ),
+        session=session,
+    )
 
     _logger.info(
         "Created branch namespace '%s' linked to git branch '%s'",
@@ -276,6 +299,7 @@ async def create_branch(
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
     access_checker: AccessChecker = Depends(get_access_checker),
+    save_history: Callable = Depends(get_save_history),
 ) -> CreateBranchResult:
     """
     Create a new branch namespace from a parent namespace.
@@ -387,6 +411,8 @@ async def create_branch(
             branch_name=branch_name,
             root_namespace=parent_ns,
             current_user=current_user,
+            save_history=save_history,
+            github_repo_path=github_repo_path,
         )
     except Exception as exc:
         _logger.exception("Namespace creation raised exception for '%s'", new_namespace)

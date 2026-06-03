@@ -454,6 +454,30 @@ class TestBranchManagement:
                 from_ref="main",
             )
 
+            # The branch creation should be recorded in history with its git
+            # metadata (nodenamespace has no timestamps, so this is the only
+            # temporal record that the branch was created).
+            history = await client_with_service_setup.get(
+                "/history/namespace/sales.feature_x/",
+            )
+            assert history.status_code == HTTPStatus.OK
+            create_events = [
+                event
+                for event in history.json()
+                if event["entity_type"] == "namespace"
+                and event["activity_type"] == "create"
+            ]
+            assert create_events, "expected a namespace create history event"
+            assert create_events[0]["entity_name"] == "sales.feature_x"
+            # parent_namespace here is the real nodenamespace FK link (the shared
+            # parent "sales"), which differs from the BranchInfo response that
+            # echoes the request namespace "sales.main".
+            assert create_events[0]["details"] == {
+                "git_branch": "feature-x",
+                "parent_namespace": "sales",
+                "github_repo_path": "myorg/myrepo",
+            }
+
     @pytest.mark.asyncio
     async def test_create_branch_from_git_root(
         self,
