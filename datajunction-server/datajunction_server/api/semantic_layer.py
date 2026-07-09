@@ -317,6 +317,7 @@ async def _generate_sql(
         limit=limit,
         use_materialized=True,
         dialect=None,
+        endpoint="/semantic-layer/views/sql",
     )
     # ``generated_sql.sql`` renders via ``to_sql(query, dialect)``, which already
     # applies DJ's dialect rules and transpiles to the resolved dialect, so it is

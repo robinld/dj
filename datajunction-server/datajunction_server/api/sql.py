@@ -634,9 +634,9 @@ async def get_metrics_sql_v3(
             Set to False when generating SQL for materialization refresh to avoid
             circular references.
     """
-    _t0 = time.monotonic()
     # Shared metrics-SQL core (cube pinning, cube_filters prepend, dialect
-    # auto-resolve, build_metrics_sql). Also used by the semantic-layer endpoint.
+    # auto-resolve, build_metrics_sql, and the build-latency metrics + [SQL] log).
+    # Also used by the semantic-layer endpoint.
     result = await generate_metrics_sql(
         session,
         metrics=metrics,
@@ -648,32 +648,6 @@ async def get_metrics_sql_v3(
         use_materialized=use_materialized,
         dialect=dialect,
         query_parameters=json.loads(query_params) or None,
-    )
-    elapsed_ms = (time.monotonic() - _t0) * 1000
-    _tags = {"query_type": "metrics", "query_version": "v3"}
-    get_metrics_provider().timer(
-        "dj.sql.build_latency_ms",
-        elapsed_ms,
-        _tags,
-    )
-    get_metrics_provider().counter("dj.sql.requests", tags=_tags)
-
-    _logger.info(
-        "[SQL] endpoint=%s metrics=%s dimensions=%s filters=%s elapsed_ms=%.1f",
-        "/sql/metrics/v3/",
-        metrics,
-        dimensions,
-        filters,
-        elapsed_ms,
-        extra={
-            "endpoint": "/sql/metrics/v3/",
-            "query_type": "metrics",
-            "query_version": "v3",
-            "metrics": metrics,
-            "dimensions": dimensions,
-            "filters": filters,
-            "elapsed_ms": elapsed_ms,
-        },
     )
 
     return V3TranslatedSQL(

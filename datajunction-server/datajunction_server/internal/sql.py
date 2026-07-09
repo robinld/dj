@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Tuple, cast
 import re
 
@@ -40,6 +41,7 @@ from datajunction_server.database.node import Node, NodeRevision
 from datajunction_server.database.catalog import Catalog
 from datajunction_server.errors import DJInvalidInputException, DJException
 from datajunction_server.internal.engines import get_engine
+from datajunction_server.instrumentation.provider import get_metrics_provider
 from datajunction_server.models import access
 from datajunction_server.models.column import SemanticType
 from datajunction_server.models.cube_materialization import Aggregability
@@ -184,6 +186,7 @@ async def generate_metrics_sql(
     use_materialized: bool = True,
     dialect: Dialect | None = None,
     query_parameters: dict[str, Any] | None = None,
+    endpoint: str = "/sql/metrics/v3/",
 ) -> "BuildV3GeneratedSQL":
     """
     Shared core for the "generate SQL for specific metrics" flow, used by both the
@@ -201,6 +204,8 @@ async def generate_metrics_sql(
         when no cube was otherwise provided (mirrors the canonical endpoint).
       - Call and return the raw ``build_metrics_sql`` result; callers map it to
         their own response models.
+      - Emit the build-latency metrics and ``[SQL]`` log here (tagged with
+        ``endpoint``) so they reflect the merged, as-built values.
     """
     # Imported lazily (like build_node_sql's build_v3 import below) to avoid an
     # import cycle: build_v3 pulls in modules that import this one.
@@ -209,6 +214,7 @@ async def generate_metrics_sql(
         resolve_dialect_and_engine_for_metrics,
     )
 
+    _t0 = time.monotonic()
     merged_filters = list(filters or [])
 
     if cube and matched_cube is None:
@@ -239,7 +245,7 @@ async def generate_metrics_sql(
         if matched_cube is None:
             matched_cube = execution_ctx.cube
 
-    return await build_metrics_sql(
+    result = await build_metrics_sql(
         session=session,
         metrics=metrics,
         dimensions=dimensions,
@@ -251,6 +257,30 @@ async def generate_metrics_sql(
         matched_cube=matched_cube,
         query_parameters=query_parameters,
     )
+
+    elapsed_ms = (time.monotonic() - _t0) * 1000
+    _tags = {"query_type": "metrics", "query_version": "v3"}
+    provider = get_metrics_provider()
+    provider.timer("dj.sql.build_latency_ms", elapsed_ms, _tags)
+    provider.counter("dj.sql.requests", tags=_tags)
+    logger.info(
+        "[SQL] endpoint=%s metrics=%s dimensions=%s filters=%s elapsed_ms=%.1f",
+        endpoint,
+        metrics,
+        dimensions,
+        merged_filters,
+        elapsed_ms,
+        extra={
+            "endpoint": endpoint,
+            "query_type": "metrics",
+            "query_version": "v3",
+            "metrics": metrics,
+            "dimensions": dimensions,
+            "filters": merged_filters,
+            "elapsed_ms": elapsed_ms,
+        },
+    )
+    return result
 
 
 async def build_sql_for_multiple_metrics(
