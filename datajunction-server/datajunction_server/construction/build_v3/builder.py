@@ -46,6 +46,9 @@ from datajunction_server.construction.build_v3.types import (
     GrainGroupSQL,
 )
 from datajunction_server.construction.build_v3.dimensions import parse_dimension_ref
+from datajunction_server.construction.build_v3.filters import (
+    get_filter_column_references,
+)
 from datajunction_server.construction.build_v3.utils import (
     add_dimensions_from_filters,
     add_dimensions_from_metric_expressions,
@@ -480,6 +483,15 @@ async def build_grain_groups(
     )
 
 
+def _telemetry_filter_columns(filters: list[str] | None) -> list[str]:
+    """Unique column names referenced across all filter predicates, for
+    telemetry — never the filter literal values."""
+    columns: set[str] = set()
+    for predicate in filters or []:
+        columns.update(get_filter_column_references(predicate))
+    return sorted(columns)
+
+
 async def build_metrics_sql(
     session: AsyncSession,
     metrics: list[str],
@@ -539,6 +551,9 @@ async def build_metrics_sql(
         "query_requested",
         metrics=list(metrics),
         dimensions=list(dimensions),
+        filter_columns=_telemetry_filter_columns(filters),
+        orderby=list(orderby or []),
+        limit=limit,
         engine=dialect.name,
     )
 
