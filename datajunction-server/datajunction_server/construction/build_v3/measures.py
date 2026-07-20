@@ -66,6 +66,8 @@ from datajunction_server.construction.build_v3.decomposition import (
     merge_grain_groups,
 )
 from datajunction_server.construction.build_v3.dimensions import (
+    check_fanout_safety,
+    find_unsafe_cardinality_links,
     parse_dimension_ref,
     resolve_dimensions,
     resolve_metric_expression_dimensions,
@@ -2315,9 +2317,15 @@ def process_metric_group(
     # Resolve dimensions (find join paths) - shared across grain groups
     resolved_dimensions = resolve_dimensions(ctx, parent_node)
 
+    # Shared across all grain groups here, so scan once.
+    unsafe_links = find_unsafe_cardinality_links(resolved_dimensions)
+
     # Build SQL for each grain group
     grain_group_sqls: list[GrainGroupSQL] = []
     for grain_group in grain_groups:
+        # Flag (don't block) fan-out risk for this grain group; see check_fanout_safety.
+        fanout_warning = check_fanout_safety(grain_group, unsafe_links)
+
         # Reset alias registry for each grain group to avoid conflicts
         ctx.alias_registry = AliasRegistry()
         ctx._table_alias_counter = 0
@@ -2328,6 +2336,7 @@ def process_metric_group(
             resolved_dimensions,
             components_per_metric,
         )
+        ctx.add_warning(fanout_warning)
         grain_group_sqls.append(grain_group_sql)
     return grain_group_sqls
 
@@ -2553,6 +2562,12 @@ def build_window_metric_grain_groups(
             component_aggregabilities=component_aggregabilities,
         )
 
+        # Per-iteration resolved_dimensions here, so the scan can't be hoisted.
+        fanout_warning = check_fanout_safety(
+            grain_group,
+            find_unsafe_cardinality_links(resolved_dimensions),
+        )
+
         # Build GrainGroupSQL
         components_per_metric: dict[str, int] = {}
         for metric_name in base_metrics_needed:
@@ -2569,6 +2584,7 @@ def build_window_metric_grain_groups(
             resolved_dimensions,
             components_per_metric,
         )
+        ctx.add_warning(fanout_warning)
 
         # Restore original dimensions
         ctx.dimensions = original_dimensions

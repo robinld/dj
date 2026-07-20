@@ -18,6 +18,7 @@ from datajunction_server.errors import (
     DJError,
     DJException,
     DJInvalidInputException,
+    DJWarning,
     ErrorCode,
 )
 from datajunction_server.construction.build_v3.materialization import (
@@ -26,11 +27,14 @@ from datajunction_server.construction.build_v3.materialization import (
 from datajunction_server.construction.build_v3.types import (
     BuildContext,
     DimensionRef,
+    GrainGroup,
     JoinPath,
     ResolvedDimension,
 )
 from datajunction_server.database.dimensionlink import DimensionLink
 from datajunction_server.database.node import Node, NodeType
+from datajunction_server.models.decompose import MetricComponent
+from datajunction_server.models.dimensionlink import JoinCardinality
 from datajunction_server.sql.parsing import ast
 from datajunction_server.sql.parsing.backends.antlr4 import parse
 from datajunction_server.utils import SEPARATOR
@@ -1023,3 +1027,89 @@ def build_join_clause(
     )
 
     return join
+
+
+# Fan-out cardinalities (default MANY_TO_ONE is safe). See check_fanout_safety.
+UNSAFE_JOIN_CARDINALITIES = frozenset(
+    {JoinCardinality.ONE_TO_MANY, JoinCardinality.MANY_TO_MANY},
+)
+
+
+def find_unsafe_cardinality_links(
+    resolved_dimensions: list[ResolvedDimension],
+) -> list[DimensionLink]:
+    """Return the emitted join-path links whose cardinality can fan out."""
+    unsafe: list[DimensionLink] = []
+    for resolved_dim in resolved_dimensions:
+        if resolved_dim.is_local or not resolved_dim.join_path:
+            continue
+        for link in resolved_dim.join_path.links:
+            if link.join_cardinality in UNSAFE_JOIN_CARDINALITIES:
+                unsafe.append(link)
+    return unsafe
+
+
+def check_fanout_safety(
+    grain_group: GrainGroup,
+    unsafe_links: list[DimensionLink],
+) -> DJWarning | None:
+    """
+    Return a fan-out warning if this grain group re-aggregates a component with an
+    additive merge function across a fanning join.
+
+    A ONE_TO_MANY/MANY_TO_MANY link duplicates fact rows, inflating additive (SUM)
+    merges. We warn rather than error: the user may know the data does not fan out.
+    """
+    if not unsafe_links:
+        return None
+
+    # Components with fan-out risk: those with a SUM merge
+    inflated: list[tuple[Node, MetricComponent]] = [
+        (metric_node, component)
+        for metric_node, component in grain_group.components
+        if component.merge == "SUM"
+    ]
+    if not inflated:
+        return None
+
+    metric_names = sorted({metric_node.name for metric_node, _ in inflated})
+    link_descriptions = sorted(
+        {
+            f"{link.node_revision.name} -> {link.dimension.name} "
+            f"({JoinCardinality(link.join_cardinality).value})"
+            for link in unsafe_links
+        },
+    )
+    metrics_str = ", ".join(metric_names)
+    links_str = "; ".join(link_descriptions)
+    message = (
+        f"Possible fan-out: metric(s) {metrics_str} aggregate across a fan-out "
+        f"link [{links_str}] when joining {grain_group.parent_node.name} to the "
+        f"requested dimensions. One fact row matches many dimension rows, so the "
+        f"result may be inflated by duplicated fact rows. If a filter constrains "
+        f"the relationship to be effectively one-to-one this result is correct; "
+        f"otherwise remove the offending dimension(s), or correct the link's "
+        f"cardinality if the relationship is not actually one-to-many or "
+        f"many-to-many."
+    )
+    logger.warning(
+        "[BuildV3] fan-out risk: metrics=%s links=%s parent=%s",
+        metrics_str,
+        links_str,
+        grain_group.parent_node.name,
+        extra={
+            "fanout_metrics": metric_names,
+            "fanout_links": link_descriptions,
+            "fanout_parent": grain_group.parent_node.name,
+            "error_code": ErrorCode.FANOUT_RISK.name,
+        },
+    )
+    return DJWarning(
+        code=ErrorCode.FANOUT_RISK,
+        message=message,
+        debug={
+            "metrics": metric_names,
+            "links": link_descriptions,
+            "parent": grain_group.parent_node.name,
+        },
+    )
