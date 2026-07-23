@@ -155,6 +155,33 @@ async def setup_fanout_links(client_with_build_v3):
     )
     assert response.status_code in (200, 201, 409), response.json()
 
+    # A MEDIAN metric: non-decomposable (holistic), so it builds via raw
+    # passthrough and is aggregated over the duplicated rows. It depends on the
+    # multiset of rows, so a fan-out distorts it and the guard MUST fire.
+    response = await client_with_build_v3.post(
+        "/nodes/metric/",
+        json={
+            "name": "v3.median_unit_price",
+            "description": "Median unit price (non-decomposable, duplication-sensitive)",
+            "query": "SELECT MEDIAN(unit_price) FROM v3.order_details",
+            "mode": "published",
+        },
+    )
+    assert response.status_code in (200, 201, 409), response.json()
+
+    # A MAX_BY metric: non-decomposable too, but argmax reads a single extreme
+    # row, so duplication can't change it. It must NOT trip the guard.
+    response = await client_with_build_v3.post(
+        "/nodes/metric/",
+        json={
+            "name": "v3.unit_price_at_max_order",
+            "description": "Unit price of the highest order_id (duplication-immune argmax)",
+            "query": "SELECT MAX_BY(unit_price, order_id) FROM v3.order_details",
+            "mode": "published",
+        },
+    )
+    assert response.status_code in (200, 201, 409), response.json()
+
 
 class TestFanoutGuardWarns:
     """Queries that cross a fan-out link with an additive metric must warn (not block)."""
@@ -239,6 +266,29 @@ class TestFanoutGuardWarns:
         assert fanout_warnings(response.json()), response.json()
 
     @pytest.mark.asyncio
+    async def test_median_over_one_to_many_warns(
+        self,
+        client_with_build_v3,
+        setup_fanout_links,
+    ):
+        """A non-decomposable holistic metric (MEDIAN) inflates → 200 + warning.
+
+        MEDIAN has no components and no SUM merge, so the merge check alone can't
+        see it; it's caught via the grain group's non-decomposable metrics.
+        """
+        response = await client_with_build_v3.get(
+            "/sql/measures/v3/",
+            params={
+                "metrics": ["v3.median_unit_price"],
+                "dimensions": ["v3.order_promotion.campaign"],
+            },
+        )
+        assert response.status_code == 200, response.json()
+        warnings = fanout_warnings(response.json())
+        assert len(warnings) == 1, response.json()
+        assert "v3.median_unit_price" in warnings[0]["message"]
+
+    @pytest.mark.asyncio
     async def test_metrics_endpoint_also_warns(
         self,
         client_with_build_v3,
@@ -317,6 +367,23 @@ class TestFanoutGuardAllows:
             "/sql/measures/v3/",
             params={
                 "metrics": ["v3.min_unit_price"],
+                "dimensions": ["v3.order_promotion.campaign"],
+            },
+        )
+        assert response.status_code == 200, response.json()
+        assert not fanout_warnings(response.json()), response.json()
+
+    @pytest.mark.asyncio
+    async def test_max_by_over_one_to_many_ok(
+        self,
+        client_with_build_v3,
+        setup_fanout_links,
+    ):
+        """MAX_BY is non-decomposable but argmax reads one extreme row → immune → no warning."""
+        response = await client_with_build_v3.get(
+            "/sql/measures/v3/",
+            params={
+                "metrics": ["v3.unit_price_at_max_order"],
                 "dimensions": ["v3.order_promotion.campaign"],
             },
         )

@@ -26,6 +26,7 @@ from datajunction_server.construction.build_v3.materialization import (
 )
 from datajunction_server.construction.build_v3.types import (
     BuildContext,
+    DecomposedMetricInfo,
     DimensionRef,
     GrainGroup,
     JoinPath,
@@ -33,8 +34,8 @@ from datajunction_server.construction.build_v3.types import (
 )
 from datajunction_server.database.dimensionlink import DimensionLink
 from datajunction_server.database.node import Node, NodeType
-from datajunction_server.models.decompose import MetricComponent
 from datajunction_server.models.dimensionlink import JoinCardinality
+from datajunction_server.sql.decompose import is_duplication_invariant
 from datajunction_server.sql.parsing import ast
 from datajunction_server.sql.parsing.backends.antlr4 import parse
 from datajunction_server.utils import SEPARATOR
@@ -1049,30 +1050,57 @@ def find_unsafe_cardinality_links(
     return unsafe
 
 
+def _nondecomposable_inflates(info: DecomposedMetricInfo) -> bool:
+    """
+    Whether a non-decomposable metric is inflated by row duplication. Holistic
+    aggregations (MEDIAN, PERCENTILE, ARRAY_AGG) depend on the full multiset of
+    rows, so duplication distorts them; argmax-style MAX_BY/MIN_BY are immune.
+    """
+    for func in info.derived_ast.find_all(ast.Function):
+        func_class = func.function()
+        if func_class is None or not func_class.is_aggregation:
+            continue
+        if not is_duplication_invariant(func_class):
+            return True
+    return False
+
+
 def check_fanout_safety(
     grain_group: GrainGroup,
     unsafe_links: list[DimensionLink],
 ) -> DJWarning | None:
     """
-    Return a fan-out warning if this grain group re-aggregates a component with an
-    additive merge function across a fanning join.
+    Return a fan-out warning if this grain group aggregates a duplication-sensitive
+    metric across a fanning join.
 
-    A ONE_TO_MANY/MANY_TO_MANY link duplicates fact rows, inflating additive (SUM)
-    merges. We warn rather than error: the user may know the data does not fan out.
+    A ONE_TO_MANY/MANY_TO_MANY link duplicates fact rows. A metric is inflated when
+    its result depends on how many times a row appears: additive re-aggregation (a
+    SUM merge, used by SUM/COUNT/AVG/...) and holistic aggregations applied over the
+    raw rows (MEDIAN, ARRAY_AGG, ...). MIN/MAX, COUNT(DISTINCT), and argmax-style
+    MAX_BY/MIN_BY are immune. We warn rather than error: the user may know the data
+    does not fan out.
     """
     if not unsafe_links:
         return None
 
-    # Components with fan-out risk: those with a SUM merge
-    inflated: list[tuple[Node, MetricComponent]] = [
-        (metric_node, component)
+    # Decomposable metrics with a SUM merge.
+    inflated_metrics: set[str] = {
+        metric_node.name
         for metric_node, component in grain_group.components
         if component.merge == "SUM"
-    ]
-    if not inflated:
+    }
+
+    # Non-decomposable holistic metrics (MEDIAN, ARRAY_AGG, ...).
+    inflated_metrics.update(
+        info.metric_node.name
+        for info in grain_group.non_decomposable_metrics
+        if _nondecomposable_inflates(info)
+    )
+
+    if not inflated_metrics:
         return None
 
-    metric_names = sorted({metric_node.name for metric_node, _ in inflated})
+    metric_names = sorted(inflated_metrics)
     link_descriptions = sorted(
         {
             f"{link.node_revision.name} -> {link.dimension.name} "
